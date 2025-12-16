@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.python_packages/
+env/
+venv/
+ENV/
+.venv/
+
+# Azure Functions
+local.settings.json
+bin/
+obj/
+appsettings.json
+readme.ipynb
+settings.json
+test.http
+
+# Environment variables
+.env
+.env.*
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
