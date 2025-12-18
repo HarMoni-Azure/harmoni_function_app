@@ -128,7 +128,7 @@ def _upload_to_blob(body: dict) -> str:
 
     # 업로드
     # - uuid 파일명이라 중복 확률 거의 없지만, overwrite=True로 확실하게
-    blob_client.upload_blob(json.dumps(body), overwrite=True)
+    blob_client.upload_blob(json.dumps(body), overwrite=False)
 
     return blob_path
 
@@ -168,6 +168,7 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     # -------------------------------------------------------------------------
     # JSON 파싱
     # -------------------------------------------------------------------------
+    
     try:
         body = req.get_json()
     except ValueError:
@@ -177,7 +178,7 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             status_code=400,
             mimetype="application/json",
         )
-
+    
     # -------------------------------------------------------------------------
     # 스키마 검증 (timestamp / sensor / isFall)
     # -------------------------------------------------------------------------
@@ -211,6 +212,7 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     # -------------------------------------------------------------------------
     # fallScore 계산 + 서버판단
     # -------------------------------------------------------------------------
+    '''
     try:
         fall_score = _calc_fall_score(sensor)
     except ValueError as e:
@@ -222,6 +224,7 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
 
     server_is_fall = fall_score >= THRESHOLD
     logging.info(f"computed fallScore={fall_score:.4f}, threshold={THRESHOLD}, server_isFall={server_is_fall}")
+    '''
 
     # -------------------------------------------------------------------------
     # Blob 업로드 (Raw 저장)
@@ -241,8 +244,10 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
     # -------------------------------------------------------------------------
     # 응답
     # - blobPath 저장여부 확인 쉽게
+    # Autoloader 기준으로 값 변경 - 기존 코드 주석 처리
     # -------------------------------------------------------------------------
-    resp = {
+    '''
+        resp = {
         "status": "ok",
         "threshold": THRESHOLD,
         "fallScore": round(fall_score, 4),
@@ -254,179 +259,10 @@ def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
             "isFall": client_is_fall,
         },
     }
-
-    return func.HttpResponse(
-        json.dumps(resp),
-        status_code=200,
-        mimetype="application/json",
-    )
-
-
-'''
-이전 버전 코드
-from azure.storage.blob import BlobServiceClient
-import json, os, uuid, datetime
-import math
-import logging
-
-import azure.functions as func
-
-
-#blob 변수
-blob_conn = os.environ["BLOB_CONNECTION_STRING"]
-container = os.environ["BLOB_CONTAINER_NAME"]
-# ------------------------------------------------------------
-# Function App 설정
-# - AuthLevel.FUNCTION: Function Key 없으면 401 (Azure 기본 보안)
-#$env:FUNC_KEY="<Function Key 값>"
-# ------------------------------------------------------------
-app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
-
-# ------------------------------------------------------------
-# 설정값
-# ------------------------------------------------------------
-THRESHOLD = 0.7
-
-# 로컬에서 "추가 인증"을 강제로 걸고 싶을 때만 사용 (선택)
-# local.settings.json에 FUNCTION_KEY를 넣고,
-# curl에 x-functions-key로 같은 값을 보내면 통과
-# - 기본은 OFF 권장 (Azure 기본 Function Key 인증만으로도 충분)
-ENABLE_LOCAL_KEY_GUARD = False
-
-def main(req):
-    blob_service_client = BlobServiceClient.from_connection_string(
-        os.environ["BLOB_CONNECTION_STRING"]
-    )
-
-    container_client = blob_service_client.get_container_client(
-        os.environ["BLOB_CONTAINER_NAME"]
-    )
-
-    body = req.get_json()
-
-    now = datetime.datetime.utcnow()
-    path = f"fall-detection/{now:%Y/%m/%d}/{uuid.uuid4()}.json"
-
-    blob_client = container_client.get_blob_client(path)
-    blob_client.upload_blob(json.dumps(body), overwrite=True)
-
-    return "ok"
-
-def _to_float(x, name: str) -> float:
-    """센서 값이 숫자인지 검사 후 float 변환"""
-    try:
-        return float(x)
-    except Exception:
-        raise ValueError(f"{name} must be a number")
-
-
-def _calc_fall_score(sensor: dict) -> float:
-    """
-    센서 기반 낙상 스코어(0~1) 계산 (간단 휴리스틱)
-    - 가속도 크기(|a|)가 1g(9.81)에서 벗어날수록 위험 증가
-    - 자이로 크기(|g|)가 커질수록 위험 증가
-    """
-    ax = _to_float(sensor.get("ax"), "sensor.ax")
-    ay = _to_float(sensor.get("ay"), "sensor.ay")
-    az = _to_float(sensor.get("az"), "sensor.az")
-
-    gx = _to_float(sensor.get("gx"), "sensor.gx")
-    gy = _to_float(sensor.get("gy"), "sensor.gy")
-    gz = _to_float(sensor.get("gz"), "sensor.gz")
-
-    a_mag = math.sqrt(ax**2 + ay**2 + az**2)
-    g_mag = math.sqrt(gx**2 + gy**2 + gz**2)
-
-    # 가속도: 1g 기준 편차를 0~1로 정규화(대략)
-    acc_dev = abs(a_mag - 9.81)
-    acc_score = min(1.0, acc_dev / 6.0)
-
-    # 자이로: 크기를 0~1로 정규화(대략)
-    gyro_score = min(1.0, g_mag / 6.0)
-
-    score = 0.7 * acc_score + 0.3 * gyro_score
-    return max(0.0, min(1.0, score))
-
-
-
-    # ------------------------------------------------------------
-    # JSON 파싱
-    # ------------------------------------------------------------
-    try:
-        body = req.get_json()
-    except ValueError:
-        logging.warning("BadRequest: Invalid JSON")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "Invalid JSON"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    # ------------------------------------------------------------
-    # 스키마 고정: timestamp / sensor / isFall
-    # ------------------------------------------------------------
-    timestamp = body.get("timestamp")
-    sensor = body.get("sensor")
-    client_is_fall = body.get("isFall")
-
-    # 로그: 들어온 payload 확인 (포털에서 확인용)
-    logging.info(f"http_trigger called. timestamp={timestamp}, client_isFall={client_is_fall}")
-
-    if not isinstance(timestamp, str):
-        logging.warning("BadRequest: timestamp is not string")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "'timestamp' must be an ISO8601 string"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    if not isinstance(sensor, dict):
-        logging.warning("BadRequest: sensor is not object")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "'sensor' must be an object"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    if not isinstance(client_is_fall, bool):
-        logging.warning("BadRequest: isFall is not boolean")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "'isFall' must be a boolean"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    # ------------------------------------------------------------
-    # 서버 판단 (threshold = 0.7)
-    # ------------------------------------------------------------
-    try:
-        fall_score = _calc_fall_score(sensor)
-    except ValueError as e:
-        logging.warning(f"BadRequest: {str(e)}")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    server_is_fall = fall_score >= THRESHOLD
-
-    # 로그: 계산 결과 (포털에서 확인용)
-    logging.info(f"computed fallScore={fall_score:.4f}, threshold={THRESHOLD}, server_isFall={server_is_fall}")
-
-    # ------------------------------------------------------------
-    # 응답
-    # ------------------------------------------------------------
+    '''
     resp = {
-        "status": "ok",
-        "threshold": THRESHOLD,
-        "fallScore": round(fall_score, 4),
-        "isFall": server_is_fall,
-        "received": {
-            "timestamp": timestamp,
-            "sensor": sensor,
-            "isFall": client_is_fall
-        }
+    "status": "accepted",
+    "blobPath": blob_path
     }
 
     return func.HttpResponse(
@@ -434,4 +270,3 @@ def _calc_fall_score(sensor: dict) -> float:
         status_code=200,
         mimetype="application/json",
     )
-'''
