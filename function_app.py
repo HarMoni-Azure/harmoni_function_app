@@ -2,271 +2,186 @@ import json
 import os
 import uuid
 import datetime
-import math
 import logging
+from datetime import timezone
 
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient
+import requests
 
-
-# =============================================================================
-# Azure Functions Python v2 모델
-# - FunctionApp 객체생성, 데코레이터(@app.route)로 HTTP 라우트 등록
-# =============================================================================
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
-# =============================================================================
-# 낙상 판정 임계값(Threshold)
-# - fallScore >= THRESHOLD 이면 서버 판단 낙상(True)
-# =============================================================================
-THRESHOLD = 0.7
-ENABLE_LOCAL_KEY_GUARD = False
-
-# =============================================================================
-# Blob 환경변수
-# - Azure 배포: Function App > Configuration(Application settings)에 설정
-# - 로컬 실행: local.settings.json의 Values에 설정
-#
-# 컨테이너 명은 local.settings.json과 Azure 포털 설정이 일치해야 함
-# 컨테이너 명 변경시 반드시 둘다 변경 해주어야 함 > 현재설정은 테스트용 functoblob-data
-# 로컬용 테스트 코드
-# =============================================================================
+# =========================
+# Blob 설정
+# =========================
 BLOB_CONNECTION_STRING = os.getenv("BLOB_CONNECTION_STRING")
-BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME")  # 예: functoblob-data
+BLOB_CONTAINER_NAME = os.getenv("BLOB_CONTAINER_NAME")
 
-
-# =============================================================================
-# BlobServiceClient는 전역에서 1회 생성 후 재사용 하는 방식
-# =============================================================================
 BLOB_SERVICE_CLIENT = (
     BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
     if BLOB_CONNECTION_STRING
     else None
 )
 
+# =========================
+# Queue / Teams 설정
+# =========================
+ALERT_QUEUE_NAME = os.getenv("ALERT_QUEUE_NAME", "auto-reported-alert")
+# Azure에 설정된 WORKFLOW_WEBHOOK_URL 기본
+WORKFLOW_WEBHOOK_URL = os.getenv("WORKFLOW_WEBHOOK_URL")
 
-def _to_float(x, name: str) -> float:
-    """
-    센서 값이 숫자인지 검사 후 float 변환
-    현재 - 변환 불가/None이면 ValueError 발생 (400으로 처리)
-    변경 - 
-    """
-    try:
-        return float(x)
-    except Exception:
-        raise ValueError(f"{name} must be a number")
-
-
-def _calc_fall_score(sensor: dict) -> float:
-    """
-    센서 기반 낙상 스코어(0~1) 계산
-
-    입력(sensor):
-      {
-        "ax": ..., "ay": ..., "az": ...,
-        "gx": ..., "gy": ..., "gz": ...
-      }
-
-    계산:
-    - 가속도 크기(|a|)가 1g(9.81)에서 벗어날수록 위험 증가
-    - 자이로 크기(|g|)가 커질수록 위험 증가
-    - score = 0.7 * acc_score + 0.3 * gyro_score
-
-    주의:
-    - MVP 단계. 추후 Azure ML 모델로 교체 가능.
-    """
-    ax = _to_float(sensor.get("ax"), "sensor.ax")
-    ay = _to_float(sensor.get("ay"), "sensor.ay")
-    az = _to_float(sensor.get("az"), "sensor.az")
-
-    gx = _to_float(sensor.get("gx"), "sensor.gx")
-    gy = _to_float(sensor.get("gy"), "sensor.gy")
-    gz = _to_float(sensor.get("gz"), "sensor.gz")
-
-    # 벡터 크기 계산
-    a_mag = math.sqrt(ax**2 + ay**2 + az**2)
-    g_mag = math.sqrt(gx**2 + gy**2 + gz**2)
-
-    # 가속도 편차(1g 기준) 정규화 (대략)
-    acc_dev = abs(a_mag - 9.81)
-    acc_score = min(1.0, acc_dev / 6.0)
-
-    # 자이로 크기 정규화 (대략)
-    gyro_score = min(1.0, g_mag / 6.0)
-
-    score = 0.7 * acc_score + 0.3 * gyro_score
-    return max(0.0, min(1.0, score))
-
-
-def _upload_to_blob(body: dict) -> str:
-    """
-    요청 바디(JSON)> Blob Storage 파일 업로드 > 업로드된 경로 반환
-
-    저장 정책(gpt추천):
-    - Raw Zone 성격으로 "요청 원본 전체"를 저장
-    - 컨테이너: BLOB_CONTAINER_NAME (예: functoblob-data)
-    - 경로: fall-detection/yyyy/MM/dd/{uuid}.json
-    - 파일 내용: JSON 문자열 (body 전체)
-    // 추후 변경 가능
-
-    실패 시:
-    - 환경변수 누락 또는 업로드 실패 시 예외 발생 → 호출부에서 500 처리
-    """
-    # 필수 설정값 체크 (실패시 missing 반환)
-    if not BLOB_SERVICE_CLIENT:
-        raise RuntimeError("BLOB_CONNECTION_STRING is missing or invalid.")
-    if not BLOB_CONTAINER_NAME:
-        raise RuntimeError("BLOB_CONTAINER_NAME is missing.")
-
-    # 애저 서버기준 날짜 파티션 >> 추후 Databricks Auto Loader에서 경로 파티션으로 활용 가능
-    now = datetime.datetime.utcnow()
-    blob_path = f"fall-detection/{now:%Y/%m/%d}/{uuid.uuid4()}.json"
-
-    # 컨테이너/블랍 클라이언트 획득
-    container_client = BLOB_SERVICE_CLIENT.get_container_client(BLOB_CONTAINER_NAME)
-    blob_client = container_client.get_blob_client(blob_path)
-
-    # 업로드
-    # - uuid 파일명이라 중복 확률 거의 없지만, overwrite=True로 확실하게
-    blob_client.upload_blob(json.dumps(body), overwrite=False)
-
-    return blob_path
-
-
+# =========================
+# HTTP Trigger
+# =========================
 @app.route(route="http_trigger", methods=["POST"])
 def http_trigger(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    HTTP Trigger 엔드포인트
-    요청(JSON) 예시:
-    {
-      "timestamp": "2025-12-16T15:42:30.123Z",
-      "sensor": {"ax":0.05,"ay":-0.12,"az":9.78,"gx":0.02,"gy":0.01,"gz":-0.03},
-      "isFall": false
-    }
-
-    처리 흐름:
-    1) (선택) 로컬 추가 키 가드
-    2) JSON 파싱
-    3) 스키마 검증(timestamp/sensor/isFall)
-    4) fallScore 계산 및 서버판단 isFall 생성
-    5) 원본 payload를 Blob에 저장 (Raw Zone)
-    6) 결과 응답 반환 (fallScore, isFall, blobPath 포함)
-    """
-
-    # -------------------------------------------------------------------------
-    # (선택) 로컬 추가 키 가드
-    # -------------------------------------------------------------------------
-    if ENABLE_LOCAL_KEY_GUARD:
-        expected_key = os.getenv("FUNCTION_KEY")
-        provided_key = req.headers.get("x-functions-key") or req.params.get("code")
-
-        # expected_key가 설정되어 있을 때만 비교
-        if expected_key and provided_key != expected_key:
-            logging.warning("Unauthorized: local key guard failed")
-            return func.HttpResponse("Unauthorized", status_code=401)
-
-    # -------------------------------------------------------------------------
-    # JSON 파싱
-    # -------------------------------------------------------------------------
-    
     try:
         body = req.get_json()
     except ValueError:
-        logging.warning("BadRequest: Invalid JSON")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "Invalid JSON"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-    
-    # -------------------------------------------------------------------------
-    # 스키마 검증 (timestamp / sensor / isFall)
-    # -------------------------------------------------------------------------
-    timestamp = body.get("timestamp")
-    sensor = body.get("sensor")
-    client_is_fall = body.get("isFall")
+        return func.HttpResponse("Invalid JSON", status_code=400)
 
-    logging.info(f"http_trigger called. timestamp={timestamp}, client_isFall={client_is_fall}")
+    body["_ingestedAt"] = datetime.datetime.now(timezone.utc).isoformat()
 
-    if not isinstance(timestamp, str):
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "'timestamp' must be an ISO8601 string"}),
-            status_code=400,
-            mimetype="application/json",
-        )
+    event_dt = datetime.datetime.fromisoformat(
+        body["timestamp"].replace("Z", "+00:00")
+    )
+    blob_path = f"fall-detection/{event_dt:%Y/%m/%d}/{uuid.uuid4()}.json"
 
-    if not isinstance(sensor, dict):
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "'sensor' must be an object"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    if not isinstance(client_is_fall, bool):
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": "'isFall' must be a boolean"}),
-            status_code=400,
-            mimetype="application/json",
-        )
-
-    # -------------------------------------------------------------------------
-    # fallScore 계산 + 서버판단
-    # -------------------------------------------------------------------------
-    '''
     try:
-        fall_score = _calc_fall_score(sensor)
-    except ValueError as e:
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(e)}),
-            status_code=400,
-            mimetype="application/json",
+        container = BLOB_SERVICE_CLIENT.get_container_client(BLOB_CONTAINER_NAME)
+        container.upload_blob(
+            name=blob_path,
+            data=json.dumps(body, ensure_ascii=False),
+            overwrite=False,
+            content_type="application/json",
         )
-
-    server_is_fall = fall_score >= THRESHOLD
-    logging.info(f"computed fallScore={fall_score:.4f}, threshold={THRESHOLD}, server_isFall={server_is_fall}")
-    '''
-
-    # -------------------------------------------------------------------------
-    # Blob 업로드 (Raw 저장)
-    # - 중요: POST 성공(200)인데 파일이 안 쌓이는 사고를 막으려면
-    #         실제 라우트 함수 안에서 업로드를 수행 >> 변경할지?
-    # -------------------------------------------------------------------------
-    try:
-        blob_path = _upload_to_blob(body)
     except Exception as e:
         logging.exception("Blob upload failed")
-        return func.HttpResponse(
-            json.dumps({"status": "error", "message": f"Blob upload failed: {str(e)}"}),
-            status_code=500,
-            mimetype="application/json",
+        return func.HttpResponse(str(e), status_code=500)
+
+    # auto_reported만 큐로 보냄
+    if body.get("type") == "auto_reported":
+        from azure.storage.queue import QueueClient
+
+        queue = QueueClient.from_connection_string(
+            os.getenv("AzureWebJobsStorage"),
+            ALERT_QUEUE_NAME,
         )
 
-    # -------------------------------------------------------------------------
-    # 응답
-    # - blobPath 저장여부 확인 쉽게
-    # Autoloader 기준으로 값 변경 - 기존 코드 주석 처리
-    # -------------------------------------------------------------------------
-    '''
-        resp = {
-        "status": "ok",
-        "threshold": THRESHOLD,
-        "fallScore": round(fall_score, 4),
-        "isFall": server_is_fall,
-        "blobPath": blob_path,
-        "received": {
-            "timestamp": timestamp,
-            "sensor": sensor,
-            "isFall": client_is_fall,
-        },
-    }
-    '''
-    resp = {
-    "status": "accepted",
-    "blobPath": blob_path
-    }
+        queue.send_message(json.dumps({
+            "eventId": str(uuid.uuid4()),
+            "timestamp": body["timestamp"],
+            "type": body["type"],
+            "device": body.get("device"),
+            "blobPath": blob_path,
+        }))
+
+        logging.info("Enqueued auto_reported alert")
+    else:
+        logging.warning(f"[HTTP] skip enqueue. type={body.get('type')} payload={body}")
 
     return func.HttpResponse(
-        json.dumps(resp),
-        status_code=200,
+        json.dumps({"status": "accepted", "blobPath": blob_path}),
+        status_code=201,
         mimetype="application/json",
     )
+
+# =========================
+# Queue Trigger
+# =========================
+@app.function_name(name="notify_teams")
+@app.queue_trigger(
+    arg_name="msg",
+    queue_name="%ALERT_QUEUE_NAME%",
+    connection="AzureWebJobsStorage",
+)
+def notify_teams(msg: func.QueueMessage):
+    raw = None
+    try:
+        raw = msg.get_body().decode("utf-8", errors="ignore")
+        logging.warning(f"[QUEUE] raw message received (len={len(raw)})")
+
+        try:
+            payload = msg.get_json()
+        except Exception:
+            logging.exception(f"[QUEUE] invalid message. raw={raw}")
+            return  # poison 방지: 깨진 메시지는 건너뛴다
+
+        logging.warning(f"[QUEUE] received: {payload}")
+
+        if not WORKFLOW_WEBHOOK_URL:
+            logging.error("WORKFLOW_WEBHOOK_URL not set. Skip sending.")
+            return  # ❗ 절대 raise 하지 마라
+
+        logging.info(
+            f"[QUEUE] posting to workflow url(len)={len(WORKFLOW_WEBHOOK_URL)} "
+            f"keys={list(payload.keys())}"
+        )
+
+        try:
+            res = requests.post(
+                WORKFLOW_WEBHOOK_URL,
+                json=payload,
+                timeout=10,
+            )
+            # 워크플로 응답을 함께 남겨서 문제 파악 쉽게
+            try:
+                body = res.text
+            except Exception:
+                body = "<no body>"
+            if res.status_code >= 300:
+                logging.error(f"Teams webhook failed status={res.status_code} body={body}")
+            else:
+                logging.info(f"Teams webhook status={res.status_code} body={body}")
+        except Exception as e:
+            logging.exception("Teams webhook failed")
+            # raise ❌ → poison 방지
+    except Exception:
+        logging.exception(f"[QUEUE] notify_teams fatal. raw={raw}")
+        return  # 모든 예외를 삼켜 poison 방지
+
+
+# =========================
+# Blob Trigger: 업로드된 JSON > 워크플로
+# =========================
+@app.function_name(name="blob_to_workflow")
+@app.blob_trigger(
+    arg_name="in_blob",
+    path="functoblob-data/fall-detection/{name}",
+    connection="AzureWebJobsStorage",
+)
+def blob_to_workflow(in_blob: func.InputStream):
+    raw = in_blob.read().decode("utf-8", errors="ignore")
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        logging.exception(f"[BLOB] invalid json. path={in_blob.name}")
+        return
+
+    logging.warning(f"[BLOB] received path={in_blob.name} keys={list(payload.keys())}")
+
+    # 오래된 이벤트 무시
+    try:
+        evt_dt = datetime.datetime.fromisoformat(
+            str(payload.get("timestamp")).replace("Z", "+00:00")
+        )
+        if evt_dt < datetime.datetime.now(timezone.utc) - datetime.timedelta(minutes=15):
+            logging.info(f"[BLOB] skip old event. ts={evt_dt.isoformat()} path={in_blob.name}")
+            return
+    except Exception:
+        logging.exception(f"[BLOB] invalid timestamp. path={in_blob.name}")
+        return
+
+    if not WORKFLOW_WEBHOOK_URL:
+        logging.error("WORKFLOW_WEBHOOK_URL not set. Skip sending.")
+        return
+
+    try:
+        res = requests.post(
+            WORKFLOW_WEBHOOK_URL,
+            json=payload,
+            timeout=10,
+        )
+        logging.info(f"[BLOB] workflow status={res.status_code} body={res.text}")
+    except Exception:
+        logging.exception("[BLOB] workflow call failed")
