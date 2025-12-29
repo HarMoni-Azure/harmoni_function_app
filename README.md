@@ -1,6 +1,8 @@
-[ HARMoni ](https://github.com/HarMoni-Azure/.github/blob/main/README.md)
+
 
 ## 1. 전체 아키텍처 개요
+
+[ HARMoni ](https://github.com/HarMoni-Azure/.github/blob/main/README.md)
 
 ### 데이터 흐름
 
@@ -20,7 +22,7 @@
 
 ## 2. 비용 관리 중심 아키텍처 설계
 
-본 프로젝트는 **비용 절감이 아닌 비용 관리(Cost Governance)**를 핵심 설계 기준으로 삼았다.
+본 프로젝트는 비용 절감이 아닌 비용 관리(Cost Governance)를 핵심 설계 기준으로 삼았다.
 
 ### 설계 배경
 - IoT 특성상 이벤트 수 증가 시 비용이 기하급수적으로 증가
