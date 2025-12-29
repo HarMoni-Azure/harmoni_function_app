@@ -1,4 +1,4 @@
-#프로젝트 이름 : [ HARMoni ](https://github.com/HarMoni-Azure/.github/blob/main/README.md) 
+[ HARMoni ](https://github.com/HarMoni-Azure/.github/blob/main/README.md)
 
 ## 1. 전체 아키텍처 개요
 
