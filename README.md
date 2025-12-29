@@ -1,6 +1,8 @@
-# HARMoni  
+[# HARMoni ](https://github.com/HarMoni-Azure/.github/blob/main/README.md) 
 
 ## 1. 전체 아키텍처 개요
+
+<img width="1647" height="865" alt="이미지" src="https://github.com/user-attachments/assets/9479da72-0d4e-4921-9011-6f36d8c075e9" />
 
 ### 데이터 흐름
 
